@@ -40,6 +40,7 @@ class SlackMessage:
     bot_id: str | None
     subtype: str | None
     thread_ts: str | None
+    channel_id: str | None = None
     files: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -53,6 +54,7 @@ class SlackMessage:
             bot_id=payload.get("bot_id"),
             subtype=payload.get("subtype"),
             thread_ts=payload.get("thread_ts"),
+            channel_id=payload.get("channel"),
             files=[item for item in files_list if isinstance(item, dict)],
         )
 

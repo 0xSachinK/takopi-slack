@@ -55,6 +55,40 @@ async def test_dispatch_command_sends_result(monkeypatch) -> None:
 
 
 @pytest.mark.anyio
+async def test_dispatch_command_sends_result_to_output_channel(monkeypatch) -> None:
+    transport = FakeTransport()
+    runtime = FakeRuntime()
+    exec_cfg = ExecBridgeConfig(transport=transport, presenter=object(), final_notify=False)
+    cfg = types.SimpleNamespace(runtime=runtime, exec_cfg=exec_cfg)
+
+    monkeypatch.setattr(
+        "takopi_slack_plugin.commands.dispatch.get_command",
+        lambda *args, **kwargs: _Backend(),
+    )
+
+    handled = await dispatch_command(
+        cfg,
+        command_id="hello",
+        args_text="",
+        full_text="/hello",
+        channel_id="C1",
+        output_channel_id="C9",
+        message_id="1",
+        thread_id=None,
+        reply_ref=MessageRef(channel_id="C1", message_id="1"),
+        reply_text=None,
+        running_tasks={},
+        on_thread_known=None,
+        default_engine_override=None,
+        default_context=None,
+        engine_overrides_resolver=None,
+    )
+
+    assert handled is True
+    assert transport.send_calls[0]["channel_id"] == "C9"
+
+
+@pytest.mark.anyio
 async def test_dispatch_command_handles_config_error(monkeypatch) -> None:
     transport = FakeTransport()
     runtime = FakeRuntime()

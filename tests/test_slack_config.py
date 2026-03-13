@@ -121,6 +121,69 @@ def test_from_config_unknown_files_key() -> None:
         SlackTransportSettings.from_config(cfg, config_path=Path("/tmp/x"))
 
 
+def test_from_config_plugin_channels() -> None:
+    cfg = {
+        "bot_token": "xoxb-1",
+        "channel_id": "C123",
+        "app_token": "xapp-1",
+        "plugin_channels": {
+            "takopi-cron": "C999",
+            "preview": "C888",
+        },
+    }
+    settings = SlackTransportSettings.from_config(cfg, config_path=Path("/tmp/x"))
+    assert settings.plugin_channels["cron"] == "C999"
+    assert settings.plugin_channels["preview"] == "C888"
+
+
+def test_from_config_plugin_channels_subcommand() -> None:
+    cfg = {
+        "bot_token": "xoxb-1",
+        "channel_id": "C123",
+        "app_token": "xapp-1",
+        "plugin_channels": {
+            "cron summary": "C777",
+        },
+    }
+    settings = SlackTransportSettings.from_config(cfg, config_path=Path("/tmp/x"))
+    assert settings.plugin_channels["cron summary"] == "C777"
+
+
+def test_from_config_plugin_channels_normalizes_subcommand_spacing() -> None:
+    cfg = {
+        "bot_token": "xoxb-1",
+        "channel_id": "C123",
+        "app_token": "xapp-1",
+        "plugin_channels": {
+            " cron   summary ": "C777",
+        },
+    }
+    settings = SlackTransportSettings.from_config(cfg, config_path=Path("/tmp/x"))
+    assert settings.plugin_channels["cron summary"] == "C777"
+
+
+def test_from_config_invalid_plugin_channels() -> None:
+    cfg = {
+        "bot_token": "xoxb-1",
+        "channel_id": "C123",
+        "app_token": "xapp-1",
+        "plugin_channels": ["cron", "C999"],
+    }
+    with pytest.raises(ConfigError):
+        SlackTransportSettings.from_config(cfg, config_path=Path("/tmp/x"))
+
+
+def test_from_config_plugin_channels_duplicate() -> None:
+    cfg = {
+        "bot_token": "xoxb-1",
+        "channel_id": "C123",
+        "app_token": "xapp-1",
+        "plugin_channels": {"cron": "C999", "takopi-cron": "C111"},
+    }
+    with pytest.raises(ConfigError):
+        SlackTransportSettings.from_config(cfg, config_path=Path("/tmp/x"))
+
+
 def test_from_config_duplicate_action_handlers() -> None:
     cfg = {
         "bot_token": "xoxb-1",

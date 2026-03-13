@@ -7,7 +7,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 from urllib.parse import parse_qs
 
 import anyio
@@ -135,6 +135,10 @@ class SlackBridgeConfig:
     client: SlackClient
     runtime: TransportRuntime
     channel_id: str
+    allowed_user_ids: list[str]
+    allowed_channel_ids: list[str]
+    plugin_channels: dict[str, str]
+    reply_mode: Literal["thread", "channel"]
     app_token: str
     startup_msg: str
     exec_cfg: ExecBridgeConfig
@@ -153,6 +157,18 @@ class CommandContext:
     default_engine_override: str | None
     engine_overrides_resolver: Callable[[str], Awaitable[EngineRunOptions | None]]
     on_thread_known: Callable[[Any, anyio.Event], Awaitable[None]] | None
+
+
+@dataclass(frozen=True, slots=True)
+class SlashCommandRequest:
+    channel_id: str
+    user_id: str | None
+    response_url: str | None
+    session_thread_id: str
+    response_thread_id: str | None
+    command_id: str
+    args_text: str
+    tokens: tuple[str, ...]
 
 
 class SlackTransport:
@@ -638,6 +654,19 @@ def _normalize_bot_token(token: str) -> str:
     return trimmed.lower()
 
 
+def _normalize_command_id(command_id: str) -> str:
+    normalized = command_id.strip().lower()
+    for prefix in ("takopi-", "takopi_"):
+        if normalized.startswith(prefix) and len(normalized) > len(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    return normalized
+
+
+def _normalize_route_key(value: str) -> str:
+    return " ".join(_normalize_command_id(value).split())
+
+
 def _strip_bot_name(text: str, *, bot_name: str) -> str:
     tokens = text.split()
     if not tokens:
@@ -714,6 +743,54 @@ def _should_skip_message(message: SlackMessage, bot_user_id: str | None) -> bool
     return False
 
 
+def _is_allowed_channel(cfg: SlackBridgeConfig, channel_id: str | None) -> bool:
+    if not isinstance(channel_id, str) or not channel_id:
+        return False
+    if "*" in cfg.allowed_channel_ids:
+        return True
+    return channel_id in cfg.allowed_channel_ids
+
+
+def _is_allowed_user(cfg: SlackBridgeConfig, user_id: str | None) -> bool:
+    if not cfg.allowed_user_ids:
+        return True
+    if not isinstance(user_id, str) or not user_id:
+        return False
+    return user_id in cfg.allowed_user_ids
+
+
+def _should_process_socket_message(
+    event: dict[str, Any],
+    message: SlackMessage,
+) -> bool:
+    event_type = event.get("type")
+    if event_type == "app_mention":
+        return True
+    channel_type = event.get("channel_type")
+    if channel_type in {"im", "mpim"}:
+        return True
+    return message.thread_ts is not None
+
+
+def _response_thread_id_for_message(
+    cfg: SlackBridgeConfig,
+    message: SlackMessage,
+) -> str | None:
+    if cfg.reply_mode == "channel":
+        return None
+    return message.thread_ts or message.ts
+
+
+def _response_thread_id(
+    cfg: SlackBridgeConfig,
+    *,
+    thread_ts: str | None,
+) -> str | None:
+    if cfg.reply_mode == "channel":
+        return None
+    return thread_ts
+
+
 async def _send_startup(cfg: SlackBridgeConfig) -> None:
     if not cfg.startup_msg.strip():
         return
@@ -732,9 +809,10 @@ async def _handle_slack_message(
     text: str,
     running_tasks: RunningTasks,
 ) -> None:
-    channel_id = cfg.channel_id
+    channel_id = message.channel_id or cfg.channel_id
     is_thread_reply = message.thread_ts is not None
-    thread_id = message.thread_ts or message.ts
+    session_thread_id = message.thread_ts or message.ts
+    response_thread_id = _response_thread_id_for_message(cfg, message)
     thread_store = cfg.thread_store
     try:
         # Reuse Takopi's directive parser to avoid double parsing.
@@ -748,7 +826,7 @@ async def _handle_slack_message(
             cfg.exec_cfg,
             channel_id=channel_id,
             user_msg_id=message.ts,
-            thread_id=thread_id,
+            thread_id=response_thread_id,
             text=f"error:\n{exc}",
             notify=False,
         )
@@ -759,37 +837,37 @@ async def _handle_slack_message(
     prompt = directives.prompt
     if directives.project is not None:
         context = RunContext(project=directives.project, branch=directives.branch)
-        if thread_store is not None and thread_id is not None:
+        if thread_store is not None and session_thread_id is not None:
             await thread_store.set_context(
                 channel_id=channel_id,
-                thread_id=thread_id,
+                thread_id=session_thread_id,
                 context=context,
             )
             if engine_override is None:
                 engine_override = await thread_store.get_default_engine(
                     channel_id=channel_id,
-                    thread_id=thread_id,
+                    thread_id=session_thread_id,
                 )
-    elif is_thread_reply and thread_store is not None and thread_id is not None:
+    elif is_thread_reply and thread_store is not None and session_thread_id is not None:
         context = await thread_store.get_context(
             channel_id=channel_id,
-            thread_id=thread_id,
+            thread_id=session_thread_id,
         )
         if context is not None:
             if directives.branch is not None and context.project is not None:
                 context = RunContext(project=context.project, branch=directives.branch)
                 await thread_store.set_context(
                     channel_id=channel_id,
-                    thread_id=thread_id,
+                    thread_id=session_thread_id,
                     context=context,
                 )
             if engine_override is None:
                 engine_override = await thread_store.get_default_engine(
                     channel_id=channel_id,
-                    thread_id=thread_id,
+                    thread_id=session_thread_id,
                 )
 
-    if thread_store is not None and thread_id is not None:
+    if thread_store is not None and session_thread_id is not None:
         worktree = None
         if context is not None and context.project and context.branch:
             worktree = WorktreeSnapshot(
@@ -801,7 +879,7 @@ async def _handle_slack_message(
         )
         await thread_store.record_activity(
             channel_id=channel_id,
-            thread_id=thread_id,
+            thread_id=session_thread_id,
             user_id=message.user,
             worktree=worktree,
             clear_worktree=clear_worktree,
@@ -816,7 +894,7 @@ async def _handle_slack_message(
         message=message,
         prompt=prompt,
         context=context,
-        thread_id=thread_id,
+        thread_id=response_thread_id,
     )
     if prompt is None:
         return
@@ -840,7 +918,7 @@ async def _handle_slack_message(
             command_context = await _resolve_command_context(
                 cfg,
                 channel_id=channel_id,
-                thread_id=thread_id,
+                thread_id=session_thread_id,
             )
         default_context = context
         if default_context is None and command_context is not None:
@@ -852,31 +930,26 @@ async def _handle_slack_message(
         reply_ref = MessageRef(
             channel_id=channel_id,
             message_id=message.ts,
-            thread_id=thread_id,
+            thread_id=response_thread_id,
         )
         full_text = command_text
         context_prefix = _format_context_directive(default_context)
         if context_prefix is not None:
             full_text = f"{context_prefix} {command_text}"
-        handled = await dispatch_command(
+        handled = await _dispatch_with_command_context(
             cfg,
             command_id=command_id,
             args_text=args_text,
             full_text=full_text,
             channel_id=channel_id,
             message_id=message.ts,
-            thread_id=thread_id,
+            thread_id=response_thread_id,
             reply_ref=reply_ref,
             reply_text=None,
             running_tasks=running_tasks,
-            on_thread_known=command_context.on_thread_known
-            if command_context is not None
-            else None,
-            default_engine_override=default_engine_override,
+            command_context=command_context,
             default_context=default_context,
-            engine_overrides_resolver=command_context.engine_overrides_resolver
-            if command_context is not None
-            else None,
+            default_engine_override=default_engine_override,
         )
         if handled:
             return
@@ -887,29 +960,29 @@ async def _handle_slack_message(
         engine_override=engine_override,
         context=context,
     )
-    if thread_store is not None and thread_id is not None:
+    if thread_store is not None and session_thread_id is not None:
         if resume_token is not None:
             await thread_store.set_resume(
                 channel_id=channel_id,
-                thread_id=thread_id,
+                thread_id=session_thread_id,
                 token=resume_token,
             )
         else:
             resume_token = await thread_store.get_resume(
                 channel_id=channel_id,
-                thread_id=thread_id,
+                thread_id=session_thread_id,
                 engine=engine_for_session,
             )
     run_options = await _resolve_run_options(
         thread_store,
         channel_id=channel_id,
-        thread_id=thread_id,
+        thread_id=session_thread_id,
         engine_id=engine_for_session,
     )
     on_thread_known = _make_resume_saver(
         thread_store,
         channel_id=channel_id,
-        thread_id=thread_id,
+        thread_id=session_thread_id,
     )
 
     await run_engine(
@@ -922,7 +995,7 @@ async def _handle_slack_message(
         resume_token=resume_token,
         context=context,
         engine_override=engine_override,
-        thread_id=thread_id,
+        thread_id=response_thread_id,
         on_thread_known=on_thread_known,
         run_options=run_options,
     )
@@ -936,7 +1009,7 @@ async def _resolve_prompt_from_media(
     context: RunContext | None,
     thread_id: str | None,
 ) -> str | None:
-    channel_id = cfg.channel_id
+    channel_id = message.channel_id or cfg.channel_id
     files = extract_files(message.files)
 
     if prompt.strip():
@@ -991,6 +1064,24 @@ async def _safe_handle_slack_message(
 
 def _session_thread_id(channel_id: str, thread_ts: str | None) -> str:
     return thread_ts if thread_ts else channel_id
+
+
+def _resolve_command_channel(
+    cfg: SlackBridgeConfig,
+    *,
+    command_id: str,
+    args_text: str = "",
+    source_channel_id: str | None = None,
+) -> str:
+    command_key = _normalize_route_key(command_id)
+    if args_text:
+        tokens = split_command_args(args_text)
+        if tokens:
+            subcommand_key = _normalize_route_key(f"{command_key} {tokens[0]}")
+            if subcommand_key in cfg.plugin_channels:
+                return cfg.plugin_channels[subcommand_key]
+    fallback_channel_id = source_channel_id or cfg.channel_id
+    return cfg.plugin_channels.get(command_key, fallback_channel_id)
 
 
 async def _respond_ephemeral(
@@ -1154,20 +1245,99 @@ async def _resolve_command_context(
     )
 
 
-async def _handle_slash_command(
+async def _dispatch_with_command_context(
+    cfg: SlackBridgeConfig,
+    *,
+    command_id: str,
+    args_text: str,
+    full_text: str,
+    channel_id: str,
+    thread_id: str | None,
+    message_id: str,
+    reply_ref: MessageRef | None,
+    reply_text: str | None,
+    running_tasks: RunningTasks,
+    command_context: CommandContext | None,
+    default_context: RunContext | None = None,
+    default_engine_override: str | None = None,
+) -> bool:
+    resolved_default_context = default_context
+    resolved_default_engine_override = default_engine_override
+    if command_context is not None:
+        if resolved_default_context is None:
+            resolved_default_context = command_context.default_context
+        if resolved_default_engine_override is None:
+            resolved_default_engine_override = command_context.default_engine_override
+
+    return await dispatch_command(
+        cfg,
+        command_id=command_id,
+        args_text=args_text,
+        full_text=full_text,
+        channel_id=channel_id,
+        output_channel_id=_resolve_command_channel(
+            cfg,
+            command_id=command_id,
+            args_text=args_text,
+            source_channel_id=channel_id,
+        ),
+        message_id=message_id,
+        thread_id=thread_id,
+        reply_ref=reply_ref,
+        reply_text=reply_text,
+        running_tasks=running_tasks,
+        on_thread_known=command_context.on_thread_known
+        if command_context is not None
+        else None,
+        default_engine_override=resolved_default_engine_override,
+        default_context=resolved_default_context,
+        engine_overrides_resolver=command_context.engine_overrides_resolver
+        if command_context is not None
+        else None,
+    )
+
+
+async def _respond_to_slash(
+    cfg: SlackBridgeConfig,
+    request: SlashCommandRequest,
+    text: str,
+) -> None:
+    await _respond_ephemeral(
+        cfg,
+        response_url=request.response_url,
+        channel_id=request.channel_id,
+        text=text,
+    )
+
+
+async def _parse_slash_command_request(
     cfg: SlackBridgeConfig,
     payload: dict[str, Any],
-    running_tasks: RunningTasks,
-) -> None:
+) -> SlashCommandRequest | None:
     channel_id = payload.get("channel_id")
-    if not isinstance(channel_id, str) or channel_id != cfg.channel_id:
-        return
+    if not isinstance(channel_id, str) or not _is_allowed_channel(cfg, channel_id):
+        return None
+    user_id = payload.get("user_id")
+    if not isinstance(user_id, str):
+        user_id = None
+    response_url = payload.get("response_url")
+    if not isinstance(response_url, str) or not response_url:
+        response_url = None
+    if not _is_allowed_user(cfg, user_id):
+        await _respond_ephemeral(
+            cfg,
+            response_url=response_url,
+            channel_id=channel_id,
+            text="this Slack user is not allowed to use Takopi.",
+        )
+        return None
+
     text = payload.get("text") or ""
     if not isinstance(text, str):
         text = ""
-    response_url = payload.get("response_url")
     thread_ts = _parse_thread_ts(payload.get("thread_ts") or payload.get("message_ts"))
-    thread_id = _session_thread_id(channel_id, thread_ts)
+    session_thread_id = _session_thread_id(channel_id, thread_ts)
+    response_thread_id = _response_thread_id(cfg, thread_ts=thread_ts)
 
     command_id = _extract_slash_payload_command(payload.get("command"))
     if command_id:
@@ -1182,254 +1352,245 @@ async def _handle_slash_command(
                 channel_id=channel_id,
                 text=_slash_usage(),
             )
-            return
+            return None
         command_id, args_text = _extract_command_text(tokens, text)
-    if command_id in {"help", "usage"}:
-        await _respond_ephemeral(
-            cfg,
-            response_url=response_url,
-            channel_id=channel_id,
-            text=_slash_usage(),
-        )
-        return
 
+    return SlashCommandRequest(
+        channel_id=channel_id,
+        user_id=user_id,
+        response_url=response_url,
+        session_thread_id=session_thread_id,
+        response_thread_id=response_thread_id,
+        command_id=command_id,
+        args_text=args_text,
+        tokens=tokens,
+    )
+
+
+async def _handle_slash_file_command(
+    cfg: SlackBridgeConfig,
+    request: SlashCommandRequest,
+) -> None:
+    command_context = None
+    if cfg.thread_store is not None:
+        command_context = await _resolve_command_context(
+            cfg,
+            channel_id=request.channel_id,
+            thread_id=request.session_thread_id,
+        )
+    await handle_file_command(
+        cfg,
+        channel_id=request.channel_id,
+        message_ts=None,
+        thread_ts=request.response_thread_id,
+        user_id=request.user_id,
+        args_text=request.args_text,
+        files=[],
+        ambient_context=command_context.default_context
+        if command_context is not None
+        else None,
+    )
+
+
+async def _maybe_handle_slash_builtin(
+    cfg: SlackBridgeConfig,
+    request: SlashCommandRequest,
+) -> bool:
     thread_store = cfg.thread_store
-    if command_id == "file":
-        command_context = None
-        if thread_store is not None:
-            command_context = await _resolve_command_context(
-                cfg,
-                channel_id=channel_id,
-                thread_id=thread_id,
-            )
-        user_id = payload.get("user_id")
-        if not isinstance(user_id, str):
-            user_id = None
-        await handle_file_command(
-            cfg,
-            channel_id=channel_id,
-            message_ts=None,
-            thread_ts=thread_ts,
-            user_id=user_id,
-            args_text=args_text,
-            files=[],
-            ambient_context=command_context.default_context if command_context else None,
-        )
-        return
     if thread_store is None:
-        await _respond_ephemeral(
+        await _respond_to_slash(
             cfg,
-            response_url=response_url,
-            channel_id=channel_id,
-            text="Slack thread state store is not configured.",
+            request,
+            "Slack thread state store is not configured.",
         )
-        return
+        return True
 
-    if command_id == "status":
+    if request.command_id == "status":
         state = await thread_store.get_state(
-            channel_id=channel_id,
-            thread_id=thread_id,
+            channel_id=request.channel_id,
+            thread_id=request.session_thread_id,
         )
-        await _respond_ephemeral(
-            cfg,
-            response_url=response_url,
-            channel_id=channel_id,
-            text=_format_status(state),
-        )
-        return
+        await _respond_to_slash(cfg, request, _format_status(state))
+        return True
 
-    if command_id == "engine":
-        if len(tokens) < 2:
-            await _respond_ephemeral(
-                cfg,
-                response_url=response_url,
-                channel_id=channel_id,
-                text="usage: /takopi engine <engine|clear>",
-            )
-            return
-        engine_value = tokens[1].strip()
+    if request.command_id == "engine":
+        if len(request.tokens) < 2:
+            await _respond_to_slash(cfg, request, "usage: /takopi engine <engine|clear>")
+            return True
+        engine_value = request.tokens[1].strip()
         if engine_value.lower() == "clear":
             await thread_store.set_default_engine(
-                channel_id=channel_id,
-                thread_id=thread_id,
+                channel_id=request.channel_id,
+                thread_id=request.session_thread_id,
                 engine=None,
             )
-            await _respond_ephemeral(
+            await _respond_to_slash(
                 cfg,
-                response_url=response_url,
-                channel_id=channel_id,
-                text="default engine cleared for this thread.",
+                request,
+                "default engine cleared for this thread.",
             )
-            return
+            return True
         engine_id = engine_value.lower()
         if engine_id not in cfg.runtime.engine_ids:
-            await _respond_ephemeral(
-                cfg,
-                response_url=response_url,
-                channel_id=channel_id,
-                text=f"unknown engine: `{engine_value}`",
-            )
-            return
+            await _respond_to_slash(cfg, request, f"unknown engine: `{engine_value}`")
+            return True
         await thread_store.set_default_engine(
-            channel_id=channel_id,
-            thread_id=thread_id,
+            channel_id=request.channel_id,
+            thread_id=request.session_thread_id,
             engine=engine_id,
         )
-        await _respond_ephemeral(
+        await _respond_to_slash(
             cfg,
-            response_url=response_url,
-            channel_id=channel_id,
-            text=f"default engine set to `{engine_id}` for this thread.",
+            request,
+            f"default engine set to `{engine_id}` for this thread.",
         )
-        return
+        return True
 
-    if command_id == "model":
-        if len(tokens) < 3:
-            await _respond_ephemeral(
+    if request.command_id == "model":
+        if len(request.tokens) < 3:
+            await _respond_to_slash(
                 cfg,
-                response_url=response_url,
-                channel_id=channel_id,
-                text="usage: /takopi model <engine> <model|clear>",
+                request,
+                "usage: /takopi model <engine> <model|clear>",
             )
-            return
-        engine_id = tokens[1].strip().lower()
-        model = tokens[2].strip()
+            return True
+        engine_id = request.tokens[1].strip().lower()
+        model = request.tokens[2].strip()
         if engine_id not in cfg.runtime.engine_ids:
-            await _respond_ephemeral(
-                cfg,
-                response_url=response_url,
-                channel_id=channel_id,
-                text=f"unknown engine: `{engine_id}`",
-            )
-            return
+            await _respond_to_slash(cfg, request, f"unknown engine: `{engine_id}`")
+            return True
         value = None if model.lower() == "clear" else model
         await thread_store.set_model_override(
-            channel_id=channel_id,
-            thread_id=thread_id,
+            channel_id=request.channel_id,
+            thread_id=request.session_thread_id,
             engine=engine_id,
             model=value,
         )
         status = "cleared" if value is None else f"set to `{value}`"
-        await _respond_ephemeral(
+        await _respond_to_slash(
             cfg,
-            response_url=response_url,
-            channel_id=channel_id,
-            text=f"model override {status} for `{engine_id}`.",
+            request,
+            f"model override {status} for `{engine_id}`.",
         )
-        return
+        return True
 
-    if command_id == "reasoning":
-        if len(tokens) < 3:
-            await _respond_ephemeral(
+    if request.command_id == "reasoning":
+        if len(request.tokens) < 3:
+            await _respond_to_slash(
                 cfg,
-                response_url=response_url,
-                channel_id=channel_id,
-                text="usage: /takopi reasoning <engine> <level|clear>",
+                request,
+                "usage: /takopi reasoning <engine> <level|clear>",
             )
-            return
-        engine_id = tokens[1].strip().lower()
-        level = tokens[2].strip().lower()
+            return True
+        engine_id = request.tokens[1].strip().lower()
+        level = request.tokens[2].strip().lower()
         if engine_id not in cfg.runtime.engine_ids:
-            await _respond_ephemeral(
-                cfg,
-                response_url=response_url,
-                channel_id=channel_id,
-                text=f"unknown engine: `{engine_id}`",
-            )
-            return
+            await _respond_to_slash(cfg, request, f"unknown engine: `{engine_id}`")
+            return True
         if level == "clear":
             await thread_store.set_reasoning_override(
-                channel_id=channel_id,
-                thread_id=thread_id,
+                channel_id=request.channel_id,
+                thread_id=request.session_thread_id,
                 engine=engine_id,
                 level=None,
             )
-            await _respond_ephemeral(
+            await _respond_to_slash(
                 cfg,
-                response_url=response_url,
-                channel_id=channel_id,
-                text=f"reasoning override cleared for `{engine_id}`.",
+                request,
+                f"reasoning override cleared for `{engine_id}`.",
             )
-            return
+            return True
         if not is_valid_reasoning_level(level):
             valid = ", ".join(sorted(REASONING_LEVELS))
-            await _respond_ephemeral(
+            await _respond_to_slash(
                 cfg,
-                response_url=response_url,
-                channel_id=channel_id,
-                text=f"invalid reasoning level. valid: {valid}",
+                request,
+                f"invalid reasoning level. valid: {valid}",
             )
-            return
+            return True
         if not supports_reasoning(engine_id):
-            await _respond_ephemeral(
+            await _respond_to_slash(
                 cfg,
-                response_url=response_url,
-                channel_id=channel_id,
-                text=f"engine `{engine_id}` does not support reasoning overrides.",
+                request,
+                f"engine `{engine_id}` does not support reasoning overrides.",
             )
-            return
+            return True
         await thread_store.set_reasoning_override(
-            channel_id=channel_id,
-            thread_id=thread_id,
+            channel_id=request.channel_id,
+            thread_id=request.session_thread_id,
             engine=engine_id,
             level=level,
         )
-        await _respond_ephemeral(
+        await _respond_to_slash(
             cfg,
-            response_url=response_url,
-            channel_id=channel_id,
-            text=f"reasoning override set to `{level}` for `{engine_id}`.",
+            request,
+            f"reasoning override set to `{level}` for `{engine_id}`.",
         )
-        return
+        return True
 
-    if command_id == "session" and len(tokens) >= 2 and tokens[1].lower() == "clear":
+    if (
+        request.command_id == "session"
+        and len(request.tokens) >= 2
+        and request.tokens[1].lower() == "clear"
+    ):
         await thread_store.clear_resumes(
-            channel_id=channel_id,
-            thread_id=thread_id,
+            channel_id=request.channel_id,
+            thread_id=request.session_thread_id,
         )
-        await _respond_ephemeral(
+        await _respond_to_slash(
             cfg,
-            response_url=response_url,
-            channel_id=channel_id,
-            text="resume tokens cleared for this thread.",
+            request,
+            "resume tokens cleared for this thread.",
         )
+        return True
+
+    return False
+
+
+async def _handle_slash_command(
+    cfg: SlackBridgeConfig,
+    payload: dict[str, Any],
+    running_tasks: RunningTasks,
+) -> None:
+    request = await _parse_slash_command_request(cfg, payload)
+    if request is None:
+        return
+    if request.command_id in {"help", "usage"}:
+        await _respond_to_slash(cfg, request, _slash_usage())
+        return
+    if request.command_id == "file":
+        await _handle_slash_file_command(cfg, request)
+        return
+    if await _maybe_handle_slash_builtin(cfg, request):
         return
 
     command_context = await _resolve_command_context(
         cfg,
-        channel_id=channel_id,
-        thread_id=thread_id,
+        channel_id=request.channel_id,
+        thread_id=request.session_thread_id,
     )
     if command_context is None:
         return
 
-    full_text = f"/{command_id} {args_text}".strip()
+    full_text = f"/{request.command_id} {request.args_text}".strip()
     context_prefix = _format_context_directive(command_context.default_context)
     if context_prefix is not None:
         full_text = f"{context_prefix} {full_text}"
-    handled = await dispatch_command(
+    handled = await _dispatch_with_command_context(
         cfg,
-        command_id=command_id,
-        args_text=args_text,
+        command_id=request.command_id,
+        args_text=request.args_text,
         full_text=full_text,
-        channel_id=channel_id,
+        channel_id=request.channel_id,
         message_id="0",
-        thread_id=thread_ts,
+        thread_id=request.response_thread_id,
         reply_ref=None,
         reply_text=None,
         running_tasks=running_tasks,
-        on_thread_known=command_context.on_thread_known,
-        default_engine_override=command_context.default_engine_override,
-        default_context=command_context.default_context,
-        engine_overrides_resolver=command_context.engine_overrides_resolver,
+        command_context=command_context,
     )
     if not handled:
-        await _respond_ephemeral(
-            cfg,
-            response_url=response_url,
-            channel_id=channel_id,
-            text=f"unknown command `{command_id}`.",
-        )
+        await _respond_to_slash(cfg, request, f"unknown command `{request.command_id}`.")
 
 
 async def _handle_interactive(
@@ -1437,6 +1598,18 @@ async def _handle_interactive(
     payload: dict[str, Any],
     running_tasks: RunningTasks,
 ) -> None:
+    channel_id = _extract_payload_channel_id(payload)
+    if channel_id is not None and not _is_allowed_channel(cfg, channel_id):
+        return
+    user_id = _extract_payload_user_id(payload)
+    if channel_id is not None and not _is_allowed_user(cfg, user_id):
+        await _respond_ephemeral(
+            cfg,
+            response_url=_extract_response_url(payload),
+            channel_id=channel_id,
+            text="this Slack user is not allowed to use Takopi.",
+        )
+        return
     payload_type = payload.get("type")
     if payload_type == "block_actions":
         if await _handle_archive_confirm_action(cfg, payload):
@@ -1473,6 +1646,30 @@ def _extract_response_url(payload: dict[str, Any]) -> str | None:
     response_url = payload.get("response_url")
     if isinstance(response_url, str) and response_url:
         return response_url
+    return None
+
+
+def _extract_payload_channel_id(payload: dict[str, Any]) -> str | None:
+    channel = payload.get("channel")
+    if isinstance(channel, dict):
+        channel_id = channel.get("id")
+        if isinstance(channel_id, str) and channel_id:
+            return channel_id
+    channel_id = payload.get("channel_id")
+    if isinstance(channel_id, str) and channel_id:
+        return channel_id
+    return None
+
+
+def _extract_payload_user_id(payload: dict[str, Any]) -> str | None:
+    user = payload.get("user")
+    if isinstance(user, dict):
+        user_id = user.get("id")
+        if isinstance(user_id, str) and user_id:
+            return user_id
+    user_id = payload.get("user_id")
+    if isinstance(user_id, str) and user_id:
+        return user_id
     return None
 
 
@@ -1770,6 +1967,7 @@ async def _handle_custom_action(
     if thread_ts is None:
         thread_ts = _extract_payload_thread_id(payload)
     thread_id = _session_thread_id(channel_id, thread_ts)
+    response_thread_id = _response_thread_id(cfg, thread_ts=thread_ts)
     command_context = await _resolve_command_context(
         cfg,
         channel_id=channel_id,
@@ -1788,27 +1986,24 @@ async def _handle_custom_action(
         reply_ref = MessageRef(
             channel_id=channel_id,
             message_id=message_ts,
-            thread_id=thread_ts,
+            thread_id=response_thread_id,
         )
         if isinstance(message_text, str):
             reply_text = message_text
 
     full_text = f"/{command_id} {args_text}".strip()
-    handled = await dispatch_command(
+    handled = await _dispatch_with_command_context(
         cfg,
         command_id=command_id,
         args_text=args_text,
         full_text=full_text,
         channel_id=channel_id,
         message_id=message_ts if isinstance(message_ts, str) else "0",
-        thread_id=thread_ts,
+        thread_id=response_thread_id,
         reply_ref=reply_ref,
         reply_text=reply_text,
         running_tasks=running_tasks,
-        on_thread_known=command_context.on_thread_known,
-        default_engine_override=command_context.default_engine_override,
-        default_context=command_context.default_context,
-        engine_overrides_resolver=command_context.engine_overrides_resolver,
+        command_context=command_context,
     )
     if not handled:
         await _respond_ephemeral(
@@ -2057,7 +2252,7 @@ async def _handle_shortcut(
 ) -> None:
     channel = payload.get("channel") or {}
     channel_id = channel.get("id") if isinstance(channel, dict) else None
-    if not isinstance(channel_id, str) or channel_id != cfg.channel_id:
+    if not _is_allowed_channel(cfg, channel_id):
         return
     message = payload.get("message") or {}
     message_text = message.get("text") if isinstance(message, dict) else None
@@ -2082,6 +2277,7 @@ async def _handle_shortcut(
     args_text = message_text.strip()
 
     thread_id = _session_thread_id(channel_id, thread_ts)
+    response_thread_id = _response_thread_id(cfg, thread_ts=thread_ts)
     command_context = await _resolve_command_context(
         cfg,
         channel_id=channel_id,
@@ -2096,25 +2292,22 @@ async def _handle_shortcut(
         reply_ref = MessageRef(
             channel_id=channel_id,
             message_id=message_ts,
-            thread_id=thread_ts,
+            thread_id=response_thread_id,
         )
         reply_text = message_text
 
-    handled = await dispatch_command(
+    handled = await _dispatch_with_command_context(
         cfg,
         command_id=command_id,
         args_text=args_text,
         full_text=f"/{command_id} {args_text}".strip(),
         channel_id=channel_id,
         message_id=message_ts if isinstance(message_ts, str) else "0",
-        thread_id=thread_ts,
+        thread_id=response_thread_id,
         reply_ref=reply_ref,
         reply_text=reply_text,
         running_tasks=running_tasks,
-        on_thread_known=command_context.on_thread_known,
-        default_engine_override=command_context.default_engine_override,
-        default_context=command_context.default_context,
-        engine_overrides_resolver=command_context.engine_overrides_resolver,
+        command_context=command_context,
     )
     if not handled:
         await _respond_ephemeral(
@@ -2399,11 +2592,15 @@ async def _run_socket_loop(
                         if event_type not in {"message", "app_mention"}:
                             continue
                         channel = event.get("channel")
-                        if channel != cfg.channel_id:
+                        if not _is_allowed_channel(cfg, channel):
                             continue
 
                         msg = SlackMessage.from_api(event)
                         if _should_skip_message(msg, bot_user_id):
+                            continue
+                        if not _is_allowed_user(cfg, msg.user):
+                            continue
+                        if not _should_process_socket_message(event, msg):
                             continue
                         cleaned = _strip_bot_mention(
                             msg.text or "",

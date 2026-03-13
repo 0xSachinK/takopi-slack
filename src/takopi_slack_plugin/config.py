@@ -124,6 +124,10 @@ class SlackTransportSettings:
     bot_token: str
     channel_id: str
     app_token: str
+    allowed_user_ids: list[str] = field(default_factory=list)
+    allowed_channel_ids: list[str] = field(default_factory=list)
+    plugin_channels: dict[str, str] = field(default_factory=dict)
+    reply_mode: Literal["thread", "channel"] = "thread"
     message_overflow: Literal["trim", "split"] = "split"
     files: SlackFilesSettings = field(default_factory=SlackFilesSettings)
     action_handlers: list[SlackActionHandler] = field(default_factory=list)
@@ -157,6 +161,36 @@ class SlackTransportSettings:
         bot_token = _require_str(config, "bot_token", config_path=config_path)
         channel_id = _require_str(config, "channel_id", config_path=config_path)
         app_token = _require_str(config, "app_token", config_path=config_path)
+        allowed_user_ids = _optional_str_list(
+            config,
+            "allowed_user_ids",
+            [],
+            config_path,
+            label="transports.slack.allowed_user_ids",
+        )
+        allowed_channel_ids = _normalize_allowed_channel_ids(
+            channel_id=channel_id,
+            values=_optional_str_list(
+                config,
+                "allowed_channel_ids",
+                [],
+                config_path,
+                label="transports.slack.allowed_channel_ids",
+            ),
+        )
+
+        reply_mode = config.get("reply_mode", "thread")
+        if not isinstance(reply_mode, str):
+            raise ConfigError(
+                f"Invalid `transports.slack.reply_mode` in {config_path}; "
+                "expected a string."
+            )
+        reply_mode = reply_mode.strip().lower()
+        if reply_mode not in {"thread", "channel"}:
+            raise ConfigError(
+                f"Invalid `transports.slack.reply_mode` in {config_path}; "
+                "expected 'thread' or 'channel'."
+            )
 
         message_overflow = config.get("message_overflow", "split")
         if not isinstance(message_overflow, str):
@@ -212,6 +246,14 @@ class SlackTransportSettings:
             bot_token=bot_token,
             channel_id=channel_id,
             app_token=app_token,
+            allowed_user_ids=allowed_user_ids,
+            allowed_channel_ids=allowed_channel_ids,
+            plugin_channels=_optional_command_channels(
+                config,
+                "plugin_channels",
+                config_path,
+            ),
+            reply_mode=reply_mode,
             message_overflow=message_overflow,
             files=files,
             action_handlers=action_handlers,
@@ -288,6 +330,28 @@ def _optional_str_list(
     return [item.strip() for item in value if item.strip()]
 
 
+def _dedupe_strings(values: Sequence[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _normalize_allowed_channel_ids(
+    *,
+    channel_id: str,
+    values: Sequence[str],
+) -> list[str]:
+    normalized_values = [value.strip() for value in values if value.strip()]
+    if any(value == "*" or value.casefold() == "all" for value in normalized_values):
+        return ["*"]
+    return _dedupe_strings([channel_id, *normalized_values])
+
+
 def _optional_action_handlers(
     config: dict[str, Any],
     key: str,
@@ -326,11 +390,7 @@ def _optional_action_handlers(
                 f"Invalid `transports.slack.{key}[{idx}].command` in {config_path}; "
                 "expected a non-empty string."
             )
-        command = command.strip().lstrip("/").lower()
-        for prefix in ("takopi-", "takopi_"):
-            if command.startswith(prefix) and len(command) > len(prefix):
-                command = command[len(prefix) :]
-                break
+        command = _normalize_command_id(command.strip().lstrip("/"))
 
         action_id_value = raw.get("action_id")
         if action_id_value is None:
@@ -428,6 +488,67 @@ def _coerce_block_list(
             f"Invalid `{label}` in {config_path}; expected a list of block objects."
         )
     return list(blocks)
+
+
+def _normalize_command_id(value: str) -> str:
+    normalized = value.strip().lower()
+    for prefix in ("takopi-", "takopi_"):
+        if normalized.startswith(prefix) and len(normalized) > len(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    return normalized
+
+
+def _normalize_command_route_key(value: str) -> str:
+    return " ".join(_normalize_command_id(value).split())
+
+
+def _optional_command_channels(
+    config: dict[str, Any],
+    key: str,
+    config_path: Path,
+) -> dict[str, str]:
+    if key not in config:
+        return {}
+    value = config.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(
+            f"Invalid `transports.slack.{key}` in {config_path}; expected a table."
+        )
+    channels: dict[str, str] = {}
+    seen: set[str] = set()
+    for raw_command_id, raw_channel_id in value.items():
+        if not isinstance(raw_command_id, str):
+            raise ConfigError(
+                f"Invalid `transports.slack.{key}` key in {config_path}; expected strings."
+            )
+        command_id = _normalize_command_route_key(raw_command_id)
+        if not command_id:
+            raise ConfigError(
+                f"Invalid `transports.slack.{key}` key in {config_path}; "
+                "expected a non-empty string."
+            )
+        if not isinstance(raw_channel_id, str):
+            raise ConfigError(
+                f'Invalid `transports.slack.{key}[\"{raw_command_id}\"]` '
+                f"in {config_path}; expected a non-empty string."
+            )
+        channel_id = raw_channel_id.strip()
+        if not channel_id:
+            raise ConfigError(
+                f'Invalid `transports.slack.{key}[\"{raw_command_id}\"]` '
+                f"in {config_path}; expected a non-empty string."
+            )
+        if command_id in seen:
+            raise ConfigError(
+                f"Invalid `transports.slack.{key}` in {config_path}; "
+                f"duplicate command id: `{command_id}`."
+            )
+        seen.add(command_id)
+        channels[command_id] = channel_id
+    return channels
 
 
 def _slugify_action_id(value: str) -> str:
