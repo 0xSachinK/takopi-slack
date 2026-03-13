@@ -63,6 +63,7 @@ class SlackCommandExecutor(CommandExecutor):
         [EngineId], Awaitable[EngineRunOptions | None]
     ] | None
     channel_id: str
+    source_channel_id: str
     user_msg_id: str
     thread_id: str | None
     show_resume_line: bool
@@ -99,22 +100,26 @@ class SlackCommandExecutor(CommandExecutor):
             if isinstance(message, RenderedMessage)
             else RenderedMessage(text=message)
         )
-        reply_ref = (
-            MessageRef(
+        cross_channel = self.channel_id != self.source_channel_id
+        reply_ref = None if cross_channel else reply_to
+        if reply_ref is not None and str(reply_ref.channel_id) != self.channel_id:
+            reply_ref = None
+
+        if reply_ref is None and not cross_channel and self.thread_id is not None:
+            reply_ref = MessageRef(
                 channel_id=self.channel_id,
                 message_id=self.user_msg_id,
                 thread_id=self.thread_id,
             )
-            if reply_to is None
-            else reply_to
-        )
+        message_thread_id = None if cross_channel else self.thread_id
+
         return await self.exec_cfg.transport.send(
             channel_id=self.channel_id,
             message=rendered,
             options=SendOptions(
                 reply_to=reply_ref,
                 notify=notify,
-                thread_id=self.thread_id,
+                thread_id=message_thread_id,
             ),
         )
 
@@ -138,6 +143,9 @@ class SlackCommandExecutor(CommandExecutor):
                 presenter=self.exec_cfg.presenter,
                 final_notify=False,
             )
+            thread_id = self.thread_id
+            if self.channel_id != self.source_channel_id:
+                thread_id = None
             await run_engine(
                 exec_cfg=exec_cfg,
                 runtime=self.runtime,
@@ -148,12 +156,15 @@ class SlackCommandExecutor(CommandExecutor):
                 resume_token=None,
                 context=request.context,
                 engine_override=engine,
-                thread_id=self.thread_id,
+                thread_id=thread_id,
                 on_thread_known=self.on_thread_known,
                 run_options=run_options,
             )
             return RunResult(engine=engine, message=capture.last_message)
 
+        thread_id = self.thread_id
+        if self.channel_id != self.source_channel_id:
+            thread_id = None
         await run_engine(
             exec_cfg=self.exec_cfg,
             runtime=self.runtime,
@@ -164,7 +175,7 @@ class SlackCommandExecutor(CommandExecutor):
             resume_token=None,
             context=request.context,
             engine_override=engine,
-            thread_id=self.thread_id,
+            thread_id=thread_id,
             on_thread_known=self.on_thread_known,
             run_options=run_options,
         )

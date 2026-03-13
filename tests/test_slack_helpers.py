@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from takopi.api import RunContext
 from takopi_slack_plugin.bridge import (
@@ -12,6 +13,7 @@ from takopi_slack_plugin.bridge import (
     _parse_thread_ts,
     _should_skip_message,
     _strip_bot_mention,
+    _resolve_command_channel,
     split_command_args,
 )
 from takopi_slack_plugin.client import SlackMessage
@@ -42,6 +44,27 @@ def test_extract_inline_command() -> None:
 def test_extract_inline_command_ignores_unknown() -> None:
     prompt = "run /unknown now"
     assert _extract_inline_command(prompt, allowed_commands={"preview"}) is None
+
+
+def test_resolve_command_channel_uses_command_fallback() -> None:
+    cfg = SimpleNamespace(
+        channel_id="C123",
+        plugin_channels={"cron": "C999"},
+    )
+    assert _resolve_command_channel(cfg, command_id="cron", args_text="summary now") == "C999"
+
+
+def test_resolve_command_channel_uses_subcommand_match() -> None:
+    cfg = SimpleNamespace(
+        channel_id="C123",
+        plugin_channels={
+            "cron summary": "C999",
+            "cron status": "C888",
+        },
+    )
+    assert _resolve_command_channel(cfg, command_id="cron", args_text="summary now") == "C999"
+    assert _resolve_command_channel(cfg, command_id="cron", args_text="status list") == "C888"
+    assert _resolve_command_channel(cfg, command_id="cron", args_text="other thing") == "C123"
 
 
 def test_extract_slash_payload_command() -> None:

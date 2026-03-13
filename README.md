@@ -1,19 +1,25 @@
 # takopi-slack-plugin
 
-slack transport plugin for takopi. socket mode only, replies in threads, and
-stores per-thread context + resume tokens.
+slack transport plugin for takopi. socket mode only, supports thread or
+top-level replies, and stores per-thread context + resume tokens.
 
 ## features
 
-- socket mode only; listens in a single channel or dm
+- socket mode only; listens in one or more configured channels or dms
 - thread sessions (context + resume tokens) stored at
   `~/.takopi/slack_thread_sessions_state.json`
 - slash commands + message shortcuts for overrides and plugin commands
 - cancel button on progress messages
 - archive button on responses (deletes worktree or resets to origin/main)
 - configurable action buttons next to archive (mapped to takopi commands)
+- optional user allowlist for who can invoke the bot
+- configurable reply mode: thread replies or top-level channel messages
 - optional stale worktree reminders prompting archive (default 24h)
 - message overflow: split or trim long responses
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the transport routing and
+session model. See [docs/TAKOPI_TOML.md](docs/TAKOPI_TOML.md) for a focused
+configuration guide.
 
 ## requirements
 
@@ -50,7 +56,7 @@ create a slack app and enable socket mode.
    `/takopi`), and optionally add dedicated commands like `/takopi-preview`
    for common plugins plus message shortcuts with callback id
    `takopi:<plugin_id>`
-5. invite the bot to the target channel
+5. invite the bot to the default channel plus any extra channels you configure
 
 add to `~/.takopi/takopi.toml`:
 
@@ -61,6 +67,9 @@ transport = "slack"
 bot_token = "xoxb-..."
 app_token = "xapp-..."
 channel_id = "C12345678"
+allowed_user_ids = ["U12345678"]
+allowed_channel_ids = ["C87654321"]
+reply_mode = "thread"
 message_overflow = "split"
 stale_worktree_reminder = true
 stale_worktree_hours = 24
@@ -88,6 +97,8 @@ action_blocks = """
   }
 ]
 """
+[transports.slack.plugin_channels]
+cron = "C87654321"
 
 [transports.slack.files]
 enabled = false
@@ -97,6 +108,18 @@ uploads_dir = "incoming"
 ```
 
 set `message_overflow = "trim"` if you prefer truncation instead of followups.
+
+`allowed_user_ids` limits who can invoke the bot. Leave it empty to allow any
+user in an allowed channel.
+
+`allowed_channel_ids` adds extra channels that the bot will listen in. The
+default `channel_id` is always included automatically. In channels, top-level
+messages must mention the bot; plain `message` events are only processed for
+thread replies. Use `allowed_channel_ids = ["*"]` or `["all"]` to allow every
+channel the bot has joined.
+
+`reply_mode = "thread"` keeps the current threaded response behavior.
+`reply_mode = "channel"` posts bot replies as top-level messages instead.
 
 `action_handlers` maps arbitrary Block Kit `action_id` values to Takopi
 commands. Use `action_id` for full control, or `id` to generate
@@ -112,12 +135,30 @@ Archive now requires confirmation: clicking `takopi-slack:archive` posts a
 confirm/cancel prompt, and confirmation deletes the worktree (discarding local
 changes).
 
+`plugin_channels` routes command outputs from specific plugin commands to
+alternate channels. Entries are keyed by command id, or by a command and first
+argument pair for subcommand-style routing:
+
+```toml
+[transports.slack.plugin_channels]
+cron = "C87654321"
+"cron summary" = "C43210987"
+```
+
+If a command is not listed, output stays in the invoking channel.
+
+You can also normalize plugin-style IDs here; `takopi-cron` and `cron` map to
+the same command key.
+
 if you use a plugin allowlist, enable this distribution:
 
 ```toml
 [plugins]
 enabled = ["takopi-slack-plugin"]
 ```
+
+For step-by-step examples, migration notes, and common channel-routing setups,
+see [docs/TAKOPI_TOML.md](docs/TAKOPI_TOML.md).
 
 ## usage
 

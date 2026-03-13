@@ -18,13 +18,18 @@ def make_reply(
     message_ts: str | None,
     thread_ts: str | None,
 ) -> Callable[..., Awaitable[None]]:
+    reply_mode = getattr(cfg, "reply_mode", "thread")
+    response_thread_ts = None if reply_mode == "channel" else thread_ts
+    if reply_mode != "channel" and response_thread_ts is None:
+        response_thread_ts = message_ts
+
     async def _reply(*, text: str) -> None:
         if message_ts:
             await send_plain(
                 cfg.exec_cfg,
                 channel_id=channel_id,
                 user_msg_id=message_ts,
-                thread_id=thread_ts or message_ts,
+                thread_id=response_thread_ts,
                 text=text,
                 notify=True,
             )
@@ -32,7 +37,11 @@ def make_reply(
         await cfg.exec_cfg.transport.send(
             channel_id=channel_id,
             message=RenderedMessage(text=text),
-            options=SendOptions(reply_to=None, notify=True, thread_id=thread_ts),
+            options=SendOptions(
+                reply_to=None,
+                notify=True,
+                thread_id=response_thread_ts,
+            ),
         )
 
     return _reply
