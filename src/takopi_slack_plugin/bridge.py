@@ -382,6 +382,7 @@ class SlackBridgeConfig:
     exec_cfg: ExecBridgeConfig
     state: ReloadableSlackState
     thread_store: SlackThreadSessionStore | None = None
+    require_mention: bool = False
 
     @property
     def client(self) -> SlackClient:
@@ -1005,6 +1006,12 @@ def _coerce_socket_payload(payload: object) -> dict[str, Any] | None:
                 return decoded
         return parsed
     return None
+
+
+def _has_bot_mention(text: str | None, bot_user_id: str | None) -> bool:
+    if not text or not bot_user_id:
+        return False
+    return bool(_mention_regex(bot_user_id).search(text))
 
 
 def _should_skip_message(message: SlackMessage, bot_user_id: str | None) -> bool:
@@ -2916,6 +2923,24 @@ async def _run_socket_loop(cfg: SlackBridgeConfig) -> None:
                             continue
                         if not _should_process_socket_message(event, msg):
                             continue
+
+                        # require_mention: only respond to @mentions or
+                        # replies in threads the bot already joined.
+                        if (
+                            cfg.require_mention
+                            and event_type != "app_mention"
+                            and not _has_bot_mention(msg.text, bot_user_id)
+                        ):
+                            # Allow replies in threads with an active session.
+                            if not msg.thread_ts or cfg.thread_store is None:
+                                continue
+                            snap = await cfg.thread_store.get_thread_snapshot(
+                                channel_id=cfg.channel_id,
+                                thread_id=msg.thread_ts,
+                            )
+                            if snap is None:
+                                continue
+
                         cleaned = _strip_bot_mention(
                             msg.text or "",
                             bot_user_id=bot_user_id,

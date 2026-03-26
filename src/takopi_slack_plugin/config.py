@@ -132,6 +132,7 @@ class SlackTransportSettings:
     files: SlackFilesSettings = field(default_factory=SlackFilesSettings)
     action_handlers: list[SlackActionHandler] = field(default_factory=list)
     action_blocks: list[dict[str, Any]] | None = None
+    require_mention: bool = False
     stale_worktree_reminder: bool = False
     stale_worktree_hours: float = 24.0
     stale_worktree_check_interval_s: float = 600.0
@@ -220,6 +221,10 @@ class SlackTransportSettings:
             config_path,
         )
 
+        require_mention = _optional_bool(
+            config, "require_mention", False, config_path
+        )
+
         stale_worktree_reminder = config.get("stale_worktree_reminder", False)
         if not isinstance(stale_worktree_reminder, bool):
             raise ConfigError(
@@ -258,6 +263,7 @@ class SlackTransportSettings:
             files=files,
             action_handlers=action_handlers,
             action_blocks=action_blocks,
+            require_mention=require_mention,
             stale_worktree_reminder=stale_worktree_reminder,
             stale_worktree_hours=stale_worktree_hours,
             stale_worktree_check_interval_s=stale_worktree_check_interval_s,

@@ -145,6 +145,7 @@ class SlackBackend(TransportBackend):
             exec_cfg=exec_cfg,
             state=state,
             thread_store=thread_store,
+            require_mention=settings.require_mention,
         )
 
         async def run_loop() -> None:
