@@ -1020,10 +1020,21 @@ def _should_skip_message(message: SlackMessage, bot_user_id: str | None) -> bool
     if message.subtype is not None and message.subtype != "file_share":
         return True
     if message.bot_id is not None:
+        # Allow self-posted /cron commands (used for auto-seed on startup).
+        if (
+            bot_user_id
+            and message.user == bot_user_id
+            and message.text
+            and message.text.lstrip().startswith("/cron")
+        ):
+            return False
         return True
     if message.user is None:
         return True
     if bot_user_id is not None and message.user == bot_user_id:
+        # Same self-/cron exception as above (for non-bot-id case).
+        if message.text and message.text.lstrip().startswith("/cron"):
+            return False
         return True
     if not message.text or not message.text.strip():
         return not bool(message.files)
